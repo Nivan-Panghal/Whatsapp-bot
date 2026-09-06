@@ -10,6 +10,7 @@ const crypto = require('crypto')
 const axios = require('axios')
 const { checkRateLimit, logLessonAccess } = require('./watermark')
 const { getRequiredAssignmentBlock } = require('./assignmentSender')
+const { getAvailabilityMessage, getNoteMessage } = require('./lessonMessages')
 
 let _supabase, _sendMessage, _config, _buildLessonMenuKeyboard, _sendCtaUrlButton
 
@@ -164,7 +165,15 @@ async function sendLesson(phone) {
     .eq('is_published', true)
     .limit(1)
 
-  if (lessonErr || !lessons?.length) {
+    if (lessonErr || !lessons?.length) {
+    // Creator-set availability message (per-lesson, from the broadcast
+    // widget) takes priority over the generic fallback below.
+    const customAvailabilityMessage = await getAvailabilityMessage(_supabase, course.id, lessonNum)
+    if (customAvailabilityMessage) {
+      await _sendMessage(phone, escMd(customAvailabilityMessage))
+      return
+    }
+
     const { count: publishedCount } = await _supabase
       .from('lessons')
       .select('id', { count: 'exact', head: true })
@@ -207,6 +216,12 @@ async function sendLesson(phone) {
       { inline_keyboard: [[{ text: 'Pay Now', url: courseUrl }]] }
     )
     return
+  }
+
+    // 4.5 Creator "note" for an already-available lesson — sent first, as its own message.
+  const noteMessage = await getNoteMessage(_supabase, lesson.id)
+  if (noteMessage) {
+    await _sendMessage(phone, escMd(noteMessage))
   }
 
   // 5. Generate signed lesson page URL

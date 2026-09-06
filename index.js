@@ -1073,6 +1073,8 @@ async function sendProgress(phone) {
   );
 }
 
+const { getAvailabilityMessage, getNoteMessage } = require("./lessonMessages");
+
 async function sendSpecificLesson(phone, lessonOrderNum) {
   const enrollment = await getEnrollment(phone);
   if (!enrollment) {
@@ -1118,11 +1120,16 @@ async function sendSpecificLesson(phone, lessonOrderNum) {
     .eq("is_published", true)
     .limit(1);
 
-  const lesson = lessons?.[0];
+    const lesson = lessons?.[0];
   if (!lesson) {
+    const customAvailabilityMessage = await getAvailabilityMessage(
+      supabase,
+      enrollment.course_uuid,
+      lessonOrderNum,
+    );
     await sendWhatsAppMessage(
       phone,
-      `⚠️ Lesson ${lessonOrderNum} is not available yet.`,
+      customAvailabilityMessage || `⚠️ Lesson ${lessonOrderNum} is not available yet.`,
     );
     return;
   }
@@ -1142,6 +1149,11 @@ async function sendSpecificLesson(phone, lessonOrderNum) {
       );
       return;
     }
+  }
+
+    const noteMessage = await getNoteMessage(supabase, lesson.id);
+  if (noteMessage) {
+    await sendWhatsAppMessage(phone, noteMessage);
   }
 
   const lessonUrl = await createWebBootstrapUrl({
