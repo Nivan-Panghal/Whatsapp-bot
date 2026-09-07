@@ -1122,14 +1122,18 @@ async function sendSpecificLesson(phone, lessonOrderNum) {
 
     const lesson = lessons?.[0];
   if (!lesson) {
-    const customAvailabilityMessage = await getAvailabilityMessage(
+        const customAvailabilityMessage = await getAvailabilityMessage(
       supabase,
       enrollment.course_uuid,
       lessonOrderNum,
     );
+    const lockedKeyboard = lessonOrderNum > 1
+      ? { inline_keyboard: [[{ text: '⬅ Previous Lesson', callback_data: `goto:${lessonOrderNum - 1}` }]] }
+      : undefined;
     await sendWhatsAppMessage(
       phone,
       customAvailabilityMessage || `⚠️ Lesson ${lessonOrderNum} is not available yet.`,
+      lockedKeyboard,
     );
     return;
   }
