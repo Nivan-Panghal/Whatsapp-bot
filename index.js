@@ -809,8 +809,8 @@ async function handleStart(phone, token) {
     const { data } = await supabase
       .from("enrollments")
       .select(
-  "id, student_id, payment_id, payment_status, delivery_method, completed_lessons, current_lesson, quiz_results",
-)
+        "id, student_id, payment_id, payment_status, delivery_method, completed_lessons, current_lesson, quiz_results",
+      )
       .eq("course_uuid", course.id)
       .eq("student_id", student.id)
       .limit(1);
@@ -821,59 +821,56 @@ async function handleStart(phone, token) {
     const { data } = await supabase
       .from("enrollments")
       .select(
-  "id, student_id, payment_id, payment_status, delivery_method, completed_lessons, current_lesson, quiz_results",
-)
+        "id, student_id, payment_id, payment_status, delivery_method, completed_lessons, current_lesson, quiz_results",
+      )
       .eq("course_uuid", course.id)
       .eq("phone", phoneOrEmail)
       .limit(1);
-    existingEnrollment = data?.[0] || null;  
+    existingEnrollment = data?.[0] || null;
   }
 
   // IMPORTANT:
-// Existing students use enrollment.delivery_method.
-// course.delivery is only the default for new enrollments.
-const effectiveDeliveryMethod =
-  existingEnrollment?.delivery_method ||
-  course.delivery ||
-  "both";
+  // Existing students use enrollment.delivery_method.
+  // course.delivery is only the default for new enrollments.
+  const effectiveDeliveryMethod =
+    existingEnrollment?.delivery_method || course.delivery || "both";
 
-if (
-  isPaid &&
-  effectiveDeliveryMethod !== "whatsapp" &&
-  effectiveDeliveryMethod !== "both"
-) {
-  console.warn(
-    "[handleStart] WhatsApp blocked by enrollment snapshot:",
-    effectiveDeliveryMethod
-  );
+  if (
+    isPaid &&
+    effectiveDeliveryMethod !== "whatsapp" &&
+    effectiveDeliveryMethod !== "both"
+  ) {
+    console.warn(
+      "[handleStart] WhatsApp blocked by enrollment snapshot:",
+      effectiveDeliveryMethod,
+    );
 
-  await sendWhatsAppMessage(
-    phone,
-    "⚠️ This course's lessons are not delivered via WhatsApp. Please use the delivery channel shown on your course page (Telegram or the web) to continue."
-  );
+    await sendWhatsAppMessage(
+      phone,
+      "⚠️ This course's lessons are not delivered via WhatsApp. Please use the delivery channel shown on your course page (Telegram or the web) to continue.",
+    );
 
-  await supabase
-    .from("whatsapp_tokens")
-    .update({
-      used: true,
-      used_at: new Date().toISOString(),
-    })
-    .eq("id", tokenRow.id);
+    await supabase
+      .from("whatsapp_tokens")
+      .update({
+        used: true,
+        used_at: new Date().toISOString(),
+      })
+      .eq("id", tokenRow.id);
 
-  return;
-}
-
+    return;
+  }
 
   const now = new Date().toISOString();
 
-const safeTokenPaymentId =
-  tokenRow.payment_id === "TEST"
-    ? `TEST:${course.id}:${tokenRow.id}`
-    : tokenRow.payment_id || null;
+  const safeTokenPaymentId =
+    tokenRow.payment_id === "TEST"
+      ? `TEST:${course.id}:${tokenRow.id}`
+      : tokenRow.payment_id || null;
 
-// 5. Update or create enrollment — never downgrade payment_status from paid to free
-let enrollmentId = null;
-let enrollError = null;
+  // 5. Update or create enrollment — never downgrade payment_status from paid to free
+  let enrollmentId = null;
+  let enrollError = null;
 
   if (existingEnrollment) {
     const newPaymentStatus =
@@ -889,12 +886,10 @@ let enrollError = null;
         student_id: student?.id || existingEnrollment.student_id || null,
         phone: phoneOrEmail,
         payment_status: newPaymentStatus,
-        payment_id:
-  existingEnrollment.payment_id || safeTokenPaymentId,
+        payment_id: existingEnrollment.payment_id || safeTokenPaymentId,
         delivery_method:
           existingEnrollment.delivery_method || course.delivery || "both",
         last_accessed: now,
-        
       })
       .eq("id", existingEnrollment.id);
 
@@ -983,6 +978,7 @@ async function markDone(phone, lessonNumber) {
   }
 
   // Call the web API so both platforms write progress the same way
+  let certificateUrl = null;
   try {
     const res = await fetch(`${ACADEMYKIT_URL}/api/lesson/complete`, {
       method: "POST",
@@ -995,7 +991,12 @@ async function markDone(phone, lessonNumber) {
       }),
     });
 
-    if (!res.ok) {
+    if (res.ok) {
+      const result = await res.json().catch(() => ({}));
+      if (result.certificateIssued && result.certificateUrl) {
+        certificateUrl = result.certificateUrl;
+      }
+    } else {
       const err = await res.json().catch(() => ({}));
       console.error("[markDone] API error:", err);
     }
@@ -1025,6 +1026,17 @@ async function markDone(phone, lessonNumber) {
       .eq("lesson_id", lesson.id)
       .maybeSingle();
     assignmentBlocksNext = !existingAssignment;
+  }
+
+  // Course finished — replace the usual lesson menu with a certificate button
+  if (certificateUrl) {
+    await sendCtaUrlButton(
+      phone,
+      `🎉 Course complete! Lesson ${lessonNumber} marked complete, and your certificate is ready.`,
+      "🎓 View Certificate",
+      certificateUrl,
+    );
+    return;
   }
 
   const message = `✅ Lesson ${lessonNumber} marked complete!`;
@@ -1120,19 +1132,30 @@ async function sendSpecificLesson(phone, lessonOrderNum) {
     .eq("is_published", true)
     .limit(1);
 
-    const lesson = lessons?.[0];
+  const lesson = lessons?.[0];
   if (!lesson) {
-        const customAvailabilityMessage = await getAvailabilityMessage(
+    const customAvailabilityMessage = await getAvailabilityMessage(
       supabase,
       enrollment.course_uuid,
       lessonOrderNum,
     );
-    const lockedKeyboard = lessonOrderNum > 1
-      ? { inline_keyboard: [[{ text: '⬅ Previous Lesson', callback_data: `goto:${lessonOrderNum - 1}` }]] }
-      : undefined;
+    const lockedKeyboard =
+      lessonOrderNum > 1
+        ? {
+            inline_keyboard: [
+              [
+                {
+                  text: "⬅ Previous Lesson",
+                  callback_data: `goto:${lessonOrderNum - 1}`,
+                },
+              ],
+            ],
+          }
+        : undefined;
     await sendWhatsAppMessage(
       phone,
-      customAvailabilityMessage || `⚠️ Lesson ${lessonOrderNum} is not available yet.`,
+      customAvailabilityMessage ||
+        `⚠️ Lesson ${lessonOrderNum} is not available yet.`,
       lockedKeyboard,
     );
     return;
@@ -1155,7 +1178,7 @@ async function sendSpecificLesson(phone, lessonOrderNum) {
     }
   }
 
-    const noteMessage = await getNoteMessage(supabase, lesson.id);
+  const noteMessage = await getNoteMessage(supabase, lesson.id);
   if (noteMessage) {
     await sendWhatsAppMessage(phone, noteMessage);
   }
@@ -1465,12 +1488,10 @@ app.post("/internal/send-reminder", async (req, res) => {
     joinUrl,
   ]);
   if (!ok) {
-    return res
-      .status(502)
-      .json({
-        error:
-          "Meta rejected the template send — check template name/approval status",
-      });
+    return res.status(502).json({
+      error:
+        "Meta rejected the template send — check template name/approval status",
+    });
   }
   return res.status(200).json({ ok: true });
 });
@@ -1517,12 +1538,10 @@ app.post("/internal/send-live-recording", async (req, res) => {
       );
 
   if (!ok) {
-    return res
-      .status(502)
-      .json({
-        error:
-          "Meta rejected the template send — check template name/approval status",
-      });
+    return res.status(502).json({
+      error:
+        "Meta rejected the template send — check template name/approval status",
+    });
   }
   return res.status(200).json({ ok: true });
 });

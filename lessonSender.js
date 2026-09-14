@@ -165,7 +165,28 @@ async function sendLesson(phone) {
     .eq('is_published', true)
     .limit(1)
 
+   
+
     if (lessonErr || !lessons?.length) {
+    // If this student already has a certificate for this course, that means
+    // they finished it — show the certificate instead of a generic "not
+    // published yet" message, which is what they'd otherwise land on right
+    // after completing the creator's marked last lesson.
+    const { data: existingCert } = await _supabase
+      .from('certificates')
+      .select('pdf_url')
+      .eq('enrollment_id', enrollment.id)
+      .maybeSingle()
+    if (existingCert?.pdf_url) {
+      await _sendCtaUrlButton(
+        phone,
+        `🎉 You've completed this course!\n\nYour certificate is ready.`,
+        '🎓 View Certificate',
+        existingCert.pdf_url,
+      )
+      return
+    }
+
     // Creator-set availability message (per-lesson, from the broadcast
     // widget) takes priority over the generic fallback below.
         const customAvailabilityMessage = await getAvailabilityMessage(_supabase, course.id, lessonNum)
