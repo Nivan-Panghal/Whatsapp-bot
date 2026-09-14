@@ -1074,9 +1074,48 @@ async function sendProgress(phone) {
   }
 
   const completed = (enrollment.completed_lessons || []).length;
-  const total = enrollment.courses.total_lessons || 0;
+
+  // `total_lessons` on the course row is a stale column that's no longer
+  // kept in sync (see api/lesson/complete's own comment on this) — compute
+  // the real total the same way certificate eligibility does: the
+  // creator's marked "last lesson" order_num if set, otherwise the count
+  // of published lessons.
+  const { data: lastLessonRow } = await supabase
+    .from("lessons")
+    .select("order_num")
+    .eq("course_id", enrollment.course_uuid)
+    .eq("is_last_lesson", true)
+    .maybeSingle();
+
+  let total = lastLessonRow?.order_num;
+  if (!total) {
+    const { count: publishedCount } = await supabase
+      .from("lessons")
+      .select("id", { count: "exact", head: true })
+      .eq("course_id", enrollment.course_uuid)
+      .eq("is_published", true);
+    total = publishedCount || 0;
+  }
+
   const percent =
     total > 0 ? Math.min(Math.round((completed / total) * 100), 100) : 0;
+
+  // Already finished? Show the certificate instead of "Continue".
+  const { data: existingCert } = await supabase
+    .from("certificates")
+    .select("pdf_url")
+    .eq("enrollment_id", enrollment.id)
+    .maybeSingle();
+
+  if (existingCert?.pdf_url) {
+    await sendCtaUrlButton(
+      phone,
+      `📊 Progress: ${completed}/${total} lessons complete (100%)\n\n🎉 Course complete! Your certificate is ready.`,
+      "🎓 View Certificate",
+      existingCert.pdf_url,
+    );
+    return;
+  }
 
   await sendWhatsAppMessage(
     phone,
@@ -1332,10 +1371,19 @@ async function handleIncomingMessage(metaMessage) {
       return;
     }
 
-    // Default response
+    // Default response — tappable buttons instead of typed commands.
+    // WhatsApp reply-button messages cap at 3 buttons, so /cancel (a rarely
+    // needed escape hatch) isn't listed here; it still works if typed.
     return sendWhatsAppMessage(
       phone,
-      "👋 *Welcome to Kurso!*\n\nHere's what you can do:\n\n📖 send *lesson* — get your next lesson\n📊 send *progress* — check your progress\n📚 send *my courses* — see all your enrolled courses\n✋ send */cancel* — cancel a pending task",
+      "👋 *Welcome to Kurso!*\n\nTap an option below to continue.",
+      {
+        inline_keyboard: [
+          [{ text: "📖 Lesson", callback_data: "lesson" }],
+          [{ text: "📊 Progress", callback_data: "progress" }],
+          [{ text: "📚 My Courses", callback_data: "mycourses" }],
+        ],
+      },
     );
   } catch (err) {
     console.error(
