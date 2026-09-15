@@ -184,6 +184,11 @@ async function sendLesson(phone) {
         '🎓 View Certificate',
         existingCert.pdf_url,
       )
+      if (lessonNum > 1) {
+        await _sendMessage(phone, 'Want to revisit anything?', {
+          inline_keyboard: [[{ text: '⬅ Previous Lesson', callback_data: `goto:${lessonNum - 1}` }]],
+        })
+      }
       return
     }
 

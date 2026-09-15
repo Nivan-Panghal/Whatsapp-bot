@@ -1036,6 +1036,11 @@ async function markDone(phone, lessonNumber) {
       "🎓 View Certificate",
       certificateUrl,
     );
+    if (lessonNumber > 1) {
+      await sendWhatsAppMessage(phone, "Want to revisit anything?", {
+        inline_keyboard: [[{ text: "⬅ Previous Lesson", callback_data: `goto:${lessonNumber - 1}` }]],
+      });
+    }
     return;
   }
 
@@ -1114,6 +1119,11 @@ async function sendProgress(phone) {
       "🎓 View Certificate",
       existingCert.pdf_url,
     );
+    if (total > 1) {
+      await sendWhatsAppMessage(phone, "Want to revisit anything?", {
+        inline_keyboard: [[{ text: "⬅ Previous Lesson", callback_data: `goto:${total - 1}` }]],
+      });
+    }
     return;
   }
 
