@@ -17,6 +17,13 @@ const {
   cancelPending,
   hasPendingSubmission,
 } = require("./assignmentSender");
+const {
+  initRatingSender,
+  maybePromptForRating,
+  hasPendingRating,
+  handleRatingReply,
+  cancelPendingRating,
+} = require("./ratingSender");
 
 const {
   sendLesson,
@@ -122,6 +129,11 @@ initAssignmentSender({
   sendMessage: async (phone, text, keyboard, opts) =>
     sendWhatsAppMessage(phone, text, keyboard, opts),
   config: {},
+});
+initRatingSender({
+  supabase,
+  sendMessage: async (phone, text, keyboard, opts) =>
+    sendWhatsAppMessage(phone, text, keyboard, opts),
 });
 
 Object.entries({
@@ -1028,7 +1040,7 @@ async function markDone(phone, lessonNumber) {
     assignmentBlocksNext = !existingAssignment;
   }
 
-  // Course finished — replace the usual lesson menu with a certificate button
+    // Course finished — replace the usual lesson menu with a certificate button
   if (certificateUrl) {
     await sendCtaUrlButton(
       phone,
@@ -1041,6 +1053,7 @@ async function markDone(phone, lessonNumber) {
         inline_keyboard: [[{ text: "⬅ Previous Lesson", callback_data: `goto:${lessonNumber - 1}` }]],
       });
     }
+    await maybePromptForRating(phone, enrollment);
     return;
   }
 
@@ -1281,13 +1294,19 @@ async function handleIncomingMessage(metaMessage) {
       text,
     );
 
+    const hasPendingRatingFlow = await hasPendingRating(phone);
+    if (hasPendingRatingFlow) {
+      if (text && !text.startsWith("/")) {
+        return handleRatingReply(phone, text);
+      }
+    }
+
     const hasPending = await hasPendingSubmission(phone);
     if (hasPending) {
       if (text && !text.startsWith("/")) {
         return submitAssignmentText(phone, text);
       }
     }
-
     if (text.startsWith("/start")) {
       const parts = text.split(" ");
       const token = parts[1] || "";
@@ -1307,8 +1326,10 @@ async function handleIncomingMessage(metaMessage) {
     if (text === "/progress" || text.toLowerCase() === "progress") {
       return sendProgress(phone);
     }
-    if (text === "/cancel" || text.toLowerCase() === "cancel") {
-      if (hasPending) {
+        if (text === "/cancel" || text.toLowerCase() === "cancel") {
+      if (hasPendingRatingFlow) {
+        await cancelPendingRating(phone);
+      } else if (hasPending) {
         await cancelPending(phone);
       } else {
         await sendWhatsAppMessage(phone, "ℹ️ Nothing to cancel.");
