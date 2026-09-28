@@ -71,6 +71,10 @@ const META_RECORDING_UNAVAILABLE_TEMPLATE =
   process.env.META_RECORDING_UNAVAILABLE_TEMPLATE_NAME ||
   "live_recording_unavailable";
 const META_TEMPLATE_LANG = process.env.META_TEMPLATE_LANG || "en";
+const META_WORKSHOP_CONFIRMATION_TEMPLATE =
+  process.env.META_WORKSHOP_CONFIRMATION_TEMPLATE_NAME || "workshop_confirmation";
+const META_WORKSHOP_REMINDER_TEMPLATE =
+  process.env.META_WORKSHOP_REMINDER_TEMPLATE_NAME || "workshop_reminder";
 const ACADEMYKIT_URL = (process.env.ACADEMYKIT_URL || "").replace(/\/$/, "");
 const LESSON_LINK_SECRET =
   process.env.WHATSAPP_LINK_SECRET ||
@@ -1625,6 +1629,63 @@ app.post("/internal/send-live-recording", async (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
+// Called by course-web's /api/workshops/register and
+// /api/workshops/registrations/confirm — fires immediately on a
+// confirmed registration (free instant, or after the creator taps
+// "Mark Paid" on a manual UPI registration). Same internal-secret auth
+// pattern as /internal/send-reminder above.
+app.post("/internal/send-workshop-confirmation", async (req, res) => {
+  const auth = req.get("Authorization") || "";
+  if (!INTERNAL_BOT_SECRET || auth !== `Bearer ${INTERNAL_BOT_SECRET}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const { phone, workshopTitle, dateTimeLabel, zoomLink } = req.body || {};
+  if (!phone || !workshopTitle || !dateTimeLabel || !zoomLink) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  const ok = await sendWhatsAppTemplate(phone, META_WORKSHOP_CONFIRMATION_TEMPLATE, [
+    { name: "workshop_title", value: workshopTitle },
+    { name: "datetime_label", value: dateTimeLabel },
+    { name: "zoom_link", value: zoomLink },
+  ]);
+  if (!ok) {
+    return res.status(502).json({
+      error: "Meta rejected the template send — check template name/approval status",
+    });
+  }
+  return res.status(200).json({ ok: true });
+});
+
+// Called by course-web's /api/cron/workshop-reminders (daily-on-Hobby-tier
+// 24h advance reminder). The 1h-before reminder does NOT come through
+// here — see pollWorkshopReminders below, running on its own timer,
+// mirroring pollLiveClassReminders.
+app.post("/internal/send-workshop-reminder", async (req, res) => {
+  const auth = req.get("Authorization") || "";
+  if (!INTERNAL_BOT_SECRET || auth !== `Bearer ${INTERNAL_BOT_SECRET}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const { phone, workshopTitle, dateTimeLabel, zoomLink } = req.body || {};
+  if (!phone || !workshopTitle || !dateTimeLabel || !zoomLink) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  const ok = await sendWhatsAppTemplate(phone, META_WORKSHOP_REMINDER_TEMPLATE, [
+    { name: "workshop_title", value: workshopTitle },
+    { name: "datetime_label", value: dateTimeLabel },
+    { name: "zoom_link", value: zoomLink },
+  ]);
+  if (!ok) {
+    return res.status(502).json({
+      error: "Meta rejected the template send — check template name/approval status",
+    });
+  }
+  return res.status(200).json({ ok: true });
+});
+
 app.get("/", (req, res) => {
   res.json({
     status: "Kurso WhatsApp bot running",
@@ -1713,6 +1774,76 @@ async function pollLiveClassReminders() {
 
 setInterval(pollLiveClassReminders, 5 * 60 * 1000);
 pollLiveClassReminders(); // also run once at startup instead of waiting 5 min for the first check
+
+// Mirrors pollLiveClassReminders exactly, scaled to a ±5-minute window
+// around the 1-hour mark instead of the 30-minute mark.
+async function pollWorkshopReminders() {
+  try {
+    const windowStart = new Date(Date.now() + 55 * 60 * 1000).toISOString();
+    const windowEnd = new Date(Date.now() + 65 * 60 * 1000).toISOString();
+
+    const { data: dueWorkshops, error: workshopsError } = await supabase
+      .from("workshops")
+      .select("id, title, date_time, zoom_link")
+      .eq("status", "published")
+      .is("reminder_1h_sent_at", null)
+      .gte("date_time", windowStart)
+      .lte("date_time", windowEnd);
+
+    if (workshopsError) {
+      console.error(
+        "[pollWorkshopReminders] workshop query failed:",
+        workshopsError.message,
+      );
+      return;
+    }
+    if (!dueWorkshops || dueWorkshops.length === 0) return;
+
+    for (const workshop of dueWorkshops) {
+      const { data: regs, error: regsError } = await supabase
+        .from("workshop_registrations")
+        .select("phone")
+        .eq("workshop_id", workshop.id)
+        .eq("payment_status", "confirmed");
+
+      if (regsError) {
+        console.error(
+          "[pollWorkshopReminders] registration query failed for workshop",
+          workshop.id,
+          regsError.message,
+        );
+        continue;
+      }
+
+      const dateTimeLabel = new Date(workshop.date_time).toLocaleString("en-IN", {
+        weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit", hour12: true,
+        timeZone: "Asia/Kolkata",
+      });
+
+      for (const r of regs || []) {
+        if (!r.phone) continue;
+        const ok = await sendWhatsAppTemplate(r.phone, META_WORKSHOP_REMINDER_TEMPLATE, [
+          { name: "workshop_title", value: workshop.title },
+          { name: "datetime_label", value: dateTimeLabel },
+          { name: "zoom_link", value: workshop.zoom_link || "Link will follow shortly" },
+        ]);
+        console.log(
+          `[pollWorkshopReminders] 1h reminder to ${r.phone} for workshop ${workshop.id}: ${ok ? "sent" : "FAILED"}`,
+        );
+      }
+
+      await supabase
+        .from("workshops")
+        .update({ reminder_1h_sent_at: new Date().toISOString() })
+        .eq("id", workshop.id);
+    }
+  } catch (err) {
+    console.error("[pollWorkshopReminders] unhandled error:", err.message);
+  }
+}
+
+setInterval(pollWorkshopReminders, 5 * 60 * 1000);
+pollWorkshopReminders(); // also run once at startup
 
 const PORT = process.env.PORT || 3003;
 
