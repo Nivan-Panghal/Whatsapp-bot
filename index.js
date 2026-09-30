@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 const { initWatermark } = require("./watermark");
 const { initQuizSender, sendQuiz } = require("./quizSender");
+const { initWorkshopNudger, pollWorkshopNudges } = require("./workshopNudger");
 const {
   initAssignmentSender,
   sendAssignmentPrompt,
@@ -75,7 +76,9 @@ const META_WORKSHOP_CONFIRMATION_TEMPLATE =
   process.env.META_WORKSHOP_CONFIRMATION_TEMPLATE_NAME || "workshop_confirmation";
 const META_WORKSHOP_REMINDER_TEMPLATE =
   process.env.META_WORKSHOP_REMINDER_TEMPLATE_NAME || "workshop_reminder";
-const ACADEMYKIT_URL = (process.env.ACADEMYKIT_URL || "").replace(/\/$/, "");
+const META_WORKSHOP_NUDGE_TEMPLATE =
+  process.env.META_WORKSHOP_NUDGE_TEMPLATE_NAME || "workshop_payment_nudge";
+const KURSO_URL = (process.env.KURSO_URL || "").replace(/\/$/, "");
 const LESSON_LINK_SECRET =
   process.env.WHATSAPP_LINK_SECRET ||
   process.env.LESSON_LINK_SECRET ||
@@ -115,7 +118,7 @@ initLessonSender({
   config: {
     WHATSAPP_LINK_SECRET: LESSON_LINK_SECRET,
     LESSON_LINK_SECRET,
-    ACADEMYKIT_URL,
+    KURSO_URL,
   },
 });
 initQuizSender({
@@ -125,7 +128,7 @@ initQuizSender({
   config: {
     WHATSAPP_LINK_SECRET: LESSON_LINK_SECRET,
     LESSON_LINK_SECRET,
-    ACADEMYKIT_URL,
+    KURSO_URL,
   },
 });
 initAssignmentSender({
@@ -139,13 +142,22 @@ initRatingSender({
   sendMessage: async (phone, text, keyboard, opts) =>
     sendWhatsAppMessage(phone, text, keyboard, opts),
 });
+initWorkshopNudger({
+  supabase,
+  sendWhatsAppTemplate: (phone, templateName, params) =>
+    sendWhatsAppTemplate(phone, templateName, params),
+  config: {
+    KURSO_URL,
+    TEMPLATE_NAME: META_WORKSHOP_NUDGE_TEMPLATE,
+  },
+});
 
 Object.entries({
   META_WHATSAPP_TOKEN: META_WHATSAPP_TOKEN,
   META_PHONE_NUMBER_ID: META_PHONE_NUMBER_ID,
   META_APP_SECRET: META_APP_SECRET,
   META_WEBHOOK_VERIFY_TOKEN: META_WEBHOOK_VERIFY_TOKEN,
-  ACADEMYKIT_URL: ACADEMYKIT_URL,
+  KURSO_URL: KURSO_URL,
   SUPABASE_URL: process.env.SUPABASE_URL,
 }).forEach(([key, value]) =>
   console.log(`${key}: ${value ? "loaded" : "MISSING"}`),
@@ -427,7 +439,7 @@ async function firstRow(query) {
 }
 
 function courseUrl(course) {
-  return `${ACADEMYKIT_URL}/course/${slugify(course.host_name || "creator")}/${slugify(course.name || course.slug || "course")}/${course.id}`;
+  return `${KURSO_URL}/course/${slugify(course.host_name || "creator")}/${slugify(course.name || course.slug || "course")}/${course.id}`;
 }
 
 // A lesson has "activities" only when it carries something EXTRA beyond
@@ -596,7 +608,7 @@ function signMyCoursesUrl(phone) {
     exp: String(exp),
     sig,
   });
-  return `${ACADEMYKIT_URL}/wa/my-courses?${params.toString()}`;
+  return `${KURSO_URL}/wa/my-courses?${params.toString()}`;
 }
 
 function signResourceUrl(lessonId, type, phone) {
@@ -612,7 +624,7 @@ function signResourceUrl(lessonId, type, phone) {
     exp: String(exp),
     sig,
   });
-  return `${ACADEMYKIT_URL}/resource/${lessonId}?${params.toString()}`;
+  return `${KURSO_URL}/resource/${lessonId}?${params.toString()}`;
 }
 
 async function getEnrollment(phone) {
@@ -996,7 +1008,7 @@ async function markDone(phone, lessonNumber) {
   // Call the web API so both platforms write progress the same way
   let certificateUrl = null;
   try {
-    const res = await fetch(`${ACADEMYKIT_URL}/api/lesson/complete`, {
+    const res = await fetch(`${KURSO_URL}/api/lesson/complete`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1234,7 +1246,7 @@ async function sendSpecificLesson(phone, lessonOrderNum) {
       enrollment.courses?.is_free_course === true || lesson.is_free === true;
     if (!isFree) {
       const course = enrollment.courses;
-      const courseUrlStr = `${ACADEMYKIT_URL}/about-course/${slugify(course?.host_name || "creator")}/${slugify(course?.name || "course")}/${enrollment.course_uuid}`;
+      const courseUrlStr = `${KURSO_URL}/about-course/${slugify(course?.host_name || "creator")}/${slugify(course?.name || "course")}/${enrollment.course_uuid}`;
       await sendWhatsAppMessage(
         phone,
         `🔒 This lesson is locked.\n\nYou've completed your free preview — pay to unlock the full course and keep going.`,
@@ -1844,6 +1856,11 @@ async function pollWorkshopReminders() {
 
 setInterval(pollWorkshopReminders, 5 * 60 * 1000);
 pollWorkshopReminders(); // also run once at startup
+
+// Pre-purchase nurture — see workshopNudger.js. Every 5 minutes, but it only
+// ever sends between 9:00 and 21:00 IST and only for creators who opted in.
+setInterval(pollWorkshopNudges, 5 * 60 * 1000);
+pollWorkshopNudges(); // also run once at startup
 
 const PORT = process.env.PORT || 3003;
 

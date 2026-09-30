@@ -32,7 +32,7 @@ function signQuizUrl(lessonId, phone) {
   const secret = _config.WHATSAPP_LINK_SECRET || _config.LESSON_LINK_SECRET
   const sig = crypto.createHmac('sha256', secret).update(payload).digest('hex')
   const params = new URLSearchParams({ type: 'quiz', identity: String(phone), exp: String(exp), sig })
-  return `${_config.ACADEMYKIT_URL}/resource/${lessonId}?${params.toString()}`
+  return `${_config.KURSO_URL}/resource/${lessonId}?${params.toString()}`
 }
 
 async function getEnrollment(phone) {
