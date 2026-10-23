@@ -24,6 +24,8 @@
  * twice. A failed send is retried up to 3 times, 15+ minutes apart.
  */
 
+const { workshopWhatsappEnabled } = require('./usage')
+
 let _supabase, _sendTemplate, _config
 
 const STEP_1_DELAY_MS = 2 * 60 * 60 * 1000
@@ -179,6 +181,8 @@ async function pollWorkshopNudges() {
       const workshop = workshopById.get(reg.workshop_id)
       const creator = workshop && creatorById.get(workshop.creator_id)
       if (!workshop || !creator || !creator.creator_slug) continue
+      // The creator can switch WhatsApp off for a workshop: no WhatsApp nudges for it.
+      if (!(await workshopWhatsappEnabled(workshop.id))) continue
 
       const createdAt = new Date(reg.created_at).getTime()
 
@@ -215,9 +219,9 @@ async function pollWorkshopNudges() {
         { name: 'workshop_title', value: cleanParam(workshop.title, 120) },
         { name: 'datetime_label', value: formatDateTimeIst(workshop.date_time) },
         { name: 'host_note', value: cleanParam(creator.nudge_note, 120) || DEFAULT_NOTE },
-        { name: 'register_link', value: registerLink },
-      ])
-      await finishNudge(reg.id, step, ok, ok ? null : 'Meta rejected the template send')
+    { name: 'register_link', value: registerLink },
+  ], { kind: 'workshop_nudge', workshopTitle: workshop.title, ctx: { creatorId: creator.id, workshopId: workshop.id } })
+  await finishNudge(reg.id, step, ok, ok ? null : 'Send failed, or promotions are paused for an overdue Kurso invoice')
       sends++
       console.log(
         `[workshopNudger] step ${step} (attempt ${attempt}) to ${reg.phone} for workshop ${workshop.id}: ${ok ? 'sent' : 'FAILED'}`,

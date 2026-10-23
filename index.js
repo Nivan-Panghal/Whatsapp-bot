@@ -10,6 +10,17 @@ const { initWatermark } = require("./watermark");
 const { initQuizSender, sendQuiz } = require("./quizSender");
 const { initWorkshopNudger, pollWorkshopNudges } = require("./workshopNudger");
 const {
+  initUsage,
+  registerTemplateCategories,
+  categoryForTemplate,
+  ctxFromBody,
+  resolveOwner,
+  recordSend,
+  handleStatusPayload,
+  isCreatorOverdue,
+  workshopWhatsappEnabled,
+} = require("./usage");
+const {
   initAssignmentSender,
   sendAssignmentPrompt,
   beginAssignmentSubmit,
@@ -78,6 +89,9 @@ const META_WORKSHOP_REMINDER_TEMPLATE =
   process.env.META_WORKSHOP_REMINDER_TEMPLATE_NAME || "workshop_reminder";
 const META_WORKSHOP_NUDGE_TEMPLATE =
   process.env.META_WORKSHOP_NUDGE_TEMPLATE_NAME || "workshop_payment_nudge";
+// The nudge is a promotional message, so it is billed (and paused for overdue creators) as marketing.
+// Every other template is treated as utility. Meta's own delivery report decides what is actually charged.
+registerTemplateCategories({ [META_WORKSHOP_NUDGE_TEMPLATE]: "marketing" });
 const KURSO_URL = (process.env.KURSO_URL || "").replace(/\/$/, "");
 const LESSON_LINK_SECRET =
   process.env.WHATSAPP_LINK_SECRET ||
@@ -108,6 +122,7 @@ const supabase = createClient(
 
 // Initialize shared modules
 initWatermark(supabase);
+initUsage({ supabase }); // counts WhatsApp messages for billing (see usage.js)
 initLessonSender({
   supabase,
   sendMessage: async (phone, text, keyboard, opts) =>
@@ -144,8 +159,7 @@ initRatingSender({
 });
 initWorkshopNudger({
   supabase,
-  sendWhatsAppTemplate: (phone, templateName, params) =>
-    sendWhatsAppTemplate(phone, templateName, params),
+sendWhatsAppTemplate: (phone, templateName, params, opts) => sendWhatsAppTemplate(phone, templateName, params, opts),
   config: {
     KURSO_URL,
     TEMPLATE_NAME: META_WORKSHOP_NUDGE_TEMPLATE,
@@ -265,10 +279,18 @@ async function sendWhatsAppMessage(toPhone, text, keyboard, opts) {
       "| status:",
       resp.status,
       "| id:",
-      resp.data?.messages?.[0]?.id,
-    );
-  } catch (err) {
-    // Log full Meta error but NEVER rethrow — a failed reply must not crash
+resp.data?.messages?.[0]?.id,
+);
+// Count it for billing. Never awaited and never allowed to fail the send.
+recordSend({
+  messageId: resp.data?.messages?.[0]?.id,
+  toPhone,
+  kind: opts?.kind || "reply",
+  category: "service",
+  ctx: opts?.ctx,
+});
+
+} catch (err) { // Log full Meta error but NEVER rethrow — a failed reply must not crash
     // the handler or roll back enrollment operations
     const errData = err.response?.data;
     console.error("[sendWhatsAppMessage] ❌ FAILED to", toPhone);
@@ -290,7 +312,7 @@ async function sendWhatsAppMessage(toPhone, text, keyboard, opts) {
 // does. So lesson delivery is now two messages: this one (just the link),
 // then a normal follow-up sendWhatsAppMessage() with the Next/Previous/
 // Activities-or-My Courses reply buttons.
-async function sendCtaUrlButton(toPhone, bodyText, buttonText, targetUrl) {
+async function sendCtaUrlButton(toPhone, bodyText, buttonText, targetUrl, opts) {
   const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
   const to = String(toPhone).replace(/\D/g, "");
 
@@ -322,12 +344,17 @@ async function sendCtaUrlButton(toPhone, bodyText, buttonText, targetUrl) {
       "| status:",
       resp.status,
       "| id:",
-      resp.data?.messages?.[0]?.id,
-    );
-    return true;
-  } catch (err) {
-    const errData = err.response?.data;
-    console.error("[sendCtaUrlButton] ❌ FAILED to", to);
+  resp.data?.messages?.[0]?.id,
+);
+recordSend({
+  messageId: resp.data?.messages?.[0]?.id,
+  toPhone,
+  kind: opts?.kind || "lesson_link",
+  category: "service",
+  ctx: opts?.ctx,
+});
+return true;
+} catch (err) { const errData = err.response?.data; console.error("[sendCtaUrlButton] ❌ FAILED to", to);
     console.error(
       "[sendCtaUrlButton] Meta error:",
       JSON.stringify(errData?.error || err.message),
@@ -359,9 +386,31 @@ async function sendCtaUrlButton(toPhone, bodyText, buttonText, targetUrl) {
 //       named-format template gets silently rejected by Meta at send
 //       time even though the template itself was approved, so the shape
 //       here has to match how each specific template was actually built)
-async function sendWhatsAppTemplate(toPhone, templateName, bodyParams) {
+async function sendWhatsAppTemplate(toPhone, templateName, bodyParams, opts) {
   const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
   const to = String(toPhone).replace(/\D/g, "");
+
+  // Billing: promotional messages are paused for a creator with an overdue Kurso invoice.
+  // Lessons, replies and reminders to people who already joined are never paused.
+  const expectedCategory = categoryForTemplate(templateName);
+  if (expectedCategory === "marketing") {
+    const owner = await resolveOwner({
+      phone: toPhone,
+      kind: opts?.kind,
+      ctx: opts?.ctx,
+      courseName: opts?.courseName,
+      workshopTitle: opts?.workshopTitle,
+    });
+    if (owner && (await isCreatorOverdue(owner.creatorId))) {
+      console.warn(
+        "[sendWhatsAppTemplate] ⏸ promotional message skipped: creator has an overdue invoice | to:",
+        to,
+        "| template:",
+        templateName,
+      );
+      return false;
+    }
+  }
 
   const parameters = bodyParams.map((p) =>
     p && typeof p === "object" && "name" in p
@@ -401,13 +450,21 @@ async function sendWhatsAppTemplate(toPhone, templateName, bodyParams) {
       "| status:",
       resp.status,
       "| id:",
-      resp.data?.messages?.[0]?.id,
-    );
-    return true;
-  } catch (err) {
-    const errData = err.response?.data;
-    console.error(
-      "[sendWhatsAppTemplate] ❌ FAILED to",
+  resp.data?.messages?.[0]?.id,
+);
+recordSend({
+  messageId: resp.data?.messages?.[0]?.id,
+  toPhone,
+  kind: opts?.kind || "template",
+  templateName,
+  category: expectedCategory,
+  ctx: opts?.ctx,
+  courseName: opts?.courseName,
+  workshopTitle: opts?.workshopTitle,
+});
+return true;
+
+} catch (err) { const errData = err.response?.data; console.error( "[sendWhatsAppTemplate] ❌ FAILED to",
       to,
       "| template:",
       templateName,
@@ -1512,8 +1569,14 @@ app.post("/webhook/whatsapp", async (req, res) => {
       JSON.stringify(req.body).slice(0, 2000),
     );
 
-    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!message) {
+// Delivery reports: Meta says here whether each message was delivered and what it charged.
+// Handled without waiting, and never allowed to affect normal message handling.
+handleStatusPayload(req.body).catch((e) =>
+  console.error("[webhook/whatsapp] status handling failed:", e.message),
+);
+
+const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+if (!message) {
       console.log(
         "[webhook/whatsapp] no message in payload — likely a status callback (sent/delivered/read), or a Meta test payload with a different shape",
       );
@@ -1576,20 +1639,7 @@ app.post("/internal/send-reminder", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  const ok = await sendWhatsAppTemplate(phone, META_LIVE_REMINDER_TEMPLATE, [
-    lessonTitle,
-    courseName,
-    timeLabel,
-    joinUrl,
-  ]);
-  if (!ok) {
-    return res.status(502).json({
-      error:
-        "Meta rejected the template send — check template name/approval status",
-    });
-  }
-  return res.status(200).json({ ok: true });
-});
+const ok = await sendWhatsAppTemplate( phone, META_LIVE_REMINDER_TEMPLATE, [lessonTitle, courseName, timeLabel, joinUrl], { kind: "live_reminder_24h", courseName, ctx: ctxFromBody(req.body) }, ); if (!ok) { return res.status(502).json({ error: "Meta rejected the template send — check template name/approval status", }); } return res.status(200).json({ ok: true }); });
 
 // Called by course-web's /api/cron/live-session-recording-notify (once
 // daily) — sends exactly one message per student per session: the
@@ -1617,12 +1667,18 @@ app.post("/internal/send-live-recording", async (req, res) => {
       .json({ error: "recordingLink required when hasRecording is true" });
   }
 
+  const usageOpts = { kind: "live_recording", courseName, ctx: ctxFromBody(req.body) };
   const ok = hasRecording
-    ? await sendWhatsAppTemplate(identity, META_RECORDING_READY_TEMPLATE, [
-        { name: "session_title", value: sessionTitle },
-        { name: "course_name", value: courseName },
-        { name: "recording_link", value: recordingLink },
-      ])
+    ? await sendWhatsAppTemplate(
+        identity,
+        META_RECORDING_READY_TEMPLATE,
+        [
+          { name: "session_title", value: sessionTitle },
+          { name: "course_name", value: courseName },
+          { name: "recording_link", value: recordingLink },
+        ],
+        usageOpts,
+      )
     : await sendWhatsAppTemplate(
         identity,
         META_RECORDING_UNAVAILABLE_TEMPLATE,
@@ -1630,6 +1686,7 @@ app.post("/internal/send-live-recording", async (req, res) => {
           { name: "session_title", value: sessionTitle },
           { name: "course_name", value: courseName },
         ],
+        usageOpts,
       );
 
   if (!ok) {
@@ -1657,11 +1714,7 @@ app.post("/internal/send-workshop-confirmation", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  const ok = await sendWhatsAppTemplate(phone, META_WORKSHOP_CONFIRMATION_TEMPLATE, [
-    { name: "workshop_title", value: workshopTitle },
-    { name: "datetime_label", value: dateTimeLabel },
-    { name: "zoom_link", value: zoomLink },
-  ]);
+const ok = await sendWhatsAppTemplate( phone, META_WORKSHOP_CONFIRMATION_TEMPLATE, [ { name: "workshop_title", value: workshopTitle }, { name: "datetime_label", value: dateTimeLabel }, { name: "zoom_link", value: zoomLink }, ], { kind: "workshop_confirmation", workshopTitle, ctx: ctxFromBody(req.body) }, );
   if (!ok) {
     return res.status(502).json({
       error: "Meta rejected the template send — check template name/approval status",
@@ -1685,11 +1738,7 @@ app.post("/internal/send-workshop-reminder", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  const ok = await sendWhatsAppTemplate(phone, META_WORKSHOP_REMINDER_TEMPLATE, [
-    { name: "workshop_title", value: workshopTitle },
-    { name: "datetime_label", value: dateTimeLabel },
-    { name: "zoom_link", value: zoomLink },
-  ]);
+const ok = await sendWhatsAppTemplate( phone, META_WORKSHOP_REMINDER_TEMPLATE, [ { name: "workshop_title", value: workshopTitle }, { name: "datetime_label", value: dateTimeLabel }, { name: "zoom_link", value: zoomLink }, ], { kind: "workshop_reminder_24h", workshopTitle, ctx: ctxFromBody(req.body) }, );
   if (!ok) {
     return res.status(502).json({
       error: "Meta rejected the template send — check template name/approval status",
@@ -1723,7 +1772,7 @@ async function pollLiveClassReminders() {
     const { data: dueLessons, error: lessonsError } = await supabase
       .from("lessons")
       .select(
-        "id, title, course_id, order_num, live_join_url, live_scheduled_at, courses:course_id(name)",
+    "id, title, course_id, order_num, live_join_url, live_scheduled_at, courses:course_id(name, creator_id)",
       )
       .eq("content_type", "live")
       .eq("is_published", true)
@@ -1764,11 +1813,18 @@ async function pollLiveClassReminders() {
         const channel = s.students?.reminder_channel;
         if (channel !== "whatsapp" || !s.phone) continue;
 
-        const ok = await sendWhatsAppTemplate(
-          s.phone,
-          META_LIVE_REMINDER_TEMPLATE,
-          [lesson.title, courseName, "in 30 minutes", lesson.live_join_url],
-        );
+    const ok = await sendWhatsAppTemplate(
+      s.phone,
+      META_LIVE_REMINDER_TEMPLATE,
+      [lesson.title, courseName, "in 30 minutes", lesson.live_join_url],
+      {
+        kind: "live_reminder_30m",
+        courseName,
+        ctx: lesson.courses?.creator_id
+          ? { creatorId: lesson.courses.creator_id, courseId: lesson.course_id }
+          : undefined,
+      },
+    );
         console.log(
           `[pollLiveClassReminders] 30m reminder to ${s.phone} for lesson ${lesson.id}: ${ok ? "sent" : "FAILED"}`,
         );
@@ -1796,9 +1852,9 @@ async function pollWorkshopReminders() {
 
     const { data: dueWorkshops, error: workshopsError } = await supabase
       .from("workshops")
-      .select("id, title, date_time, zoom_link")
-      .eq("status", "published")
-      .is("reminder_1h_sent_at", null)
+  .select("id, creator_id, title, date_time, zoom_link")
+  .eq("status", "published")
+  .is("reminder_1h_sent_at", null)
       .gte("date_time", windowStart)
       .lte("date_time", windowEnd);
 
@@ -1811,10 +1867,19 @@ async function pollWorkshopReminders() {
     }
     if (!dueWorkshops || dueWorkshops.length === 0) return;
 
-    for (const workshop of dueWorkshops) {
-      const { data: regs, error: regsError } = await supabase
-        .from("workshop_registrations")
-        .select("phone")
+for (const workshop of dueWorkshops) {
+  // The creator can switch WhatsApp off for a workshop. Email and Telegram still reach people.
+  if (!(await workshopWhatsappEnabled(workshop.id))) {
+    console.log("[pollWorkshopReminders] WhatsApp is switched off for workshop", workshop.id, "- skipping");
+    await supabase
+      .from("workshops")
+      .update({ reminder_1h_sent_at: new Date().toISOString() })
+      .eq("id", workshop.id);
+    continue;
+  }
+  const { data: regs, error: regsError } = await supabase
+    .from("workshop_registrations")
+    .select("phone")
         .eq("workshop_id", workshop.id)
         .eq("payment_status", "confirmed");
 
@@ -1834,11 +1899,22 @@ async function pollWorkshopReminders() {
 
       for (const r of regs || []) {
         if (!r.phone) continue;
-        const ok = await sendWhatsAppTemplate(r.phone, META_WORKSHOP_REMINDER_TEMPLATE, [
-          { name: "workshop_title", value: workshop.title },
-          { name: "datetime_label", value: dateTimeLabel },
-          { name: "zoom_link", value: workshop.zoom_link || "Link will follow shortly" },
-        ]);
+    const ok = await sendWhatsAppTemplate(
+      r.phone,
+      META_WORKSHOP_REMINDER_TEMPLATE,
+      [
+        { name: "workshop_title", value: workshop.title },
+        { name: "datetime_label", value: dateTimeLabel },
+        { name: "zoom_link", value: workshop.zoom_link || "Link will follow shortly" },
+      ],
+      {
+        kind: "workshop_reminder_1h",
+        workshopTitle: workshop.title,
+        ctx: workshop.creator_id
+          ? { creatorId: workshop.creator_id, workshopId: workshop.id }
+          : undefined,
+      },
+    );
         console.log(
           `[pollWorkshopReminders] 1h reminder to ${r.phone} for workshop ${workshop.id}: ${ok ? "sent" : "FAILED"}`,
         );
