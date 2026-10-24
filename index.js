@@ -20,6 +20,19 @@ const {
   isCreatorOverdue,
   workshopWhatsappEnabled,
 } = require("./usage");
+
+const {
+  initConnections,
+  accountForPhoneNumberId,
+  hasConnectedNumber,
+  pickAccount,
+  runWithAccount,
+  describeMetaError,
+  isAccountLevelError,
+  isTemplateNotReadyError,
+  reportProblem,
+  setupTemplates,
+} = require("./connections");
 const {
   initAssignmentSender,
   sendAssignmentPrompt,
@@ -123,6 +136,18 @@ const supabase = createClient(
 // Initialize shared modules
 initWatermark(supabase);
 initUsage({ supabase }); // counts WhatsApp messages for billing (see usage.js)
+// Creators who connected their OWN WhatsApp number send from it (see connections.js).
+initConnections({
+  supabase,
+  config: {
+    kursoUrl: KURSO_URL,
+    internalSecret: INTERNAL_BOT_SECRET,
+    graphVersion: META_GRAPH_VERSION,
+    kursoWabaId: process.env.META_WABA_ID || "",
+    kursoToken: META_WHATSAPP_TOKEN,
+    templateLang: META_TEMPLATE_LANG,
+  },
+});
 initLessonSender({
   supabase,
   sendMessage: async (phone, text, keyboard, opts) =>
@@ -261,18 +286,45 @@ function buildWhatsAppPayload(toPhone, text, keyboard, opts) {
   };
 }
 
+// Sends one message to Meta. Every send in this bot goes through here.
+//   - If the creator connected their own WhatsApp number, it goes out from that number.
+//   - Otherwise (or if that number has a problem) it goes out from Kurso's number, as before.
+// Returns { resp, account }: account is the creator's number if it was used, or null for Kurso's.
+async function postToMeta(payload, pickInfo) {
+  const account = await pickAccount({ resolveOwner, ...pickInfo });
+  const headers = (token) => ({ "Content-Type": "application/json", Authorization: `Bearer ${token}` });
+
+  if (account) {
+    try {
+      const resp = await axios.post(
+        `https://graph.facebook.com/${META_GRAPH_VERSION}/${account.phoneNumberId}/messages`,
+        payload,
+        { headers: headers(account.token), timeout: 10000 },
+      );
+      return { resp, account };
+    } catch (err) {
+      if (isAccountLevelError(err)) {
+        reportProblem(account, describeMetaError(err));
+      } else if (!isTemplateNotReadyError(err)) {
+        throw err; // a normal failure (bad recipient, etc.): do not resend from another number
+      }
+      console.warn("[postToMeta] creator's own number could not send, using Kurso's number |", describeMetaError(err));
+    }
+  }
+
+  const resp = await axios.post(
+    `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_PHONE_NUMBER_ID}/messages`,
+    payload,
+    { headers: headers(META_WHATSAPP_TOKEN), timeout: 10000 },
+  );
+  return { resp, account: null };
+}
+
 async function sendWhatsAppMessage(toPhone, text, keyboard, opts) {
-  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
   const payload = buildWhatsAppPayload(toPhone, text, keyboard, opts);
 
   try {
-    const resp = await axios.post(url, payload, {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${META_WHATSAPP_TOKEN}`,
-      },
-      timeout: 10000,
-    });
+    const { resp, account } = await postToMeta(payload, { phone: toPhone, kind: opts?.kind || "reply", ctx: opts?.ctx });
     console.log(
       "[sendWhatsAppMessage] ✅ sent to",
       toPhone,
@@ -288,6 +340,7 @@ recordSend({
   kind: opts?.kind || "reply",
   category: "service",
   ctx: opts?.ctx,
+  account: account ? { creatorId: account.creatorId, phoneNumberId: account.phoneNumberId } : null,
 });
 
 } catch (err) { // Log full Meta error but NEVER rethrow — a failed reply must not crash
@@ -313,7 +366,7 @@ recordSend({
 // then a normal follow-up sendWhatsAppMessage() with the Next/Previous/
 // Activities-or-My Courses reply buttons.
 async function sendCtaUrlButton(toPhone, bodyText, buttonText, targetUrl, opts) {
-  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
+
   const to = String(toPhone).replace(/\D/g, "");
 
   const payload = {
@@ -331,13 +384,7 @@ async function sendCtaUrlButton(toPhone, bodyText, buttonText, targetUrl, opts) 
   };
 
   try {
-    const resp = await axios.post(url, payload, {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${META_WHATSAPP_TOKEN}`,
-      },
-      timeout: 10000,
-    });
+        const { resp, account } = await postToMeta(payload, { phone: toPhone, kind: opts?.kind || "lesson_link", ctx: opts?.ctx });
     console.log(
       "[sendCtaUrlButton] ✅ sent to",
       to,
@@ -352,6 +399,7 @@ recordSend({
   kind: opts?.kind || "lesson_link",
   category: "service",
   ctx: opts?.ctx,
+  account: account ? { creatorId: account.creatorId, phoneNumberId: account.phoneNumberId } : null,
 });
 return true;
 } catch (err) { const errData = err.response?.data; console.error("[sendCtaUrlButton] ❌ FAILED to", to);
@@ -387,7 +435,7 @@ return true;
 //       time even though the template itself was approved, so the shape
 //       here has to match how each specific template was actually built)
 async function sendWhatsAppTemplate(toPhone, templateName, bodyParams, opts) {
-  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_PHONE_NUMBER_ID}/messages`;
+  
   const to = String(toPhone).replace(/\D/g, "");
 
   // Billing: promotional messages are paused for a creator with an overdue Kurso invoice.
@@ -401,7 +449,7 @@ async function sendWhatsAppTemplate(toPhone, templateName, bodyParams, opts) {
       courseName: opts?.courseName,
       workshopTitle: opts?.workshopTitle,
     });
-    if (owner && (await isCreatorOverdue(owner.creatorId))) {
+        if (owner && !(await hasConnectedNumber(owner.creatorId)) && (await isCreatorOverdue(owner.creatorId))) {
       console.warn(
         "[sendWhatsAppTemplate] ⏸ promotional message skipped: creator has an overdue invoice | to:",
         to,
@@ -435,12 +483,12 @@ async function sendWhatsAppTemplate(toPhone, templateName, bodyParams, opts) {
   };
 
   try {
-    const resp = await axios.post(url, payload, {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${META_WHATSAPP_TOKEN}`,
-      },
-      timeout: 10000,
+        const { resp, account } = await postToMeta(payload, {
+      phone: toPhone,
+      kind: opts?.kind || "template",
+      ctx: opts?.ctx,
+      courseName: opts?.courseName,
+      workshopTitle: opts?.workshopTitle,
     });
     console.log(
       "[sendWhatsAppTemplate] ✅ sent to",
@@ -461,6 +509,7 @@ recordSend({
   ctx: opts?.ctx,
   courseName: opts?.courseName,
   workshopTitle: opts?.workshopTitle,
+  account: account ? { creatorId: account.creatorId, phoneNumberId: account.phoneNumberId } : null,
 });
 return true;
 
@@ -1612,7 +1661,14 @@ if (!message) {
         .insert({ message_sid: messageId });
     }
 
-    await handleIncomingMessage(message);
+    // Which of our numbers did the student write to? If it is a creator's own number, every reply
+    // in this conversation goes out from that same number.
+    const incomingNumberId = req.body.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
+    const account =
+      incomingNumberId && String(incomingNumberId) !== String(META_PHONE_NUMBER_ID)
+        ? await accountForPhoneNumberId(String(incomingNumberId))
+        : null;
+    await runWithAccount(account, () => handleIncomingMessage(message));
   } catch (err) {
     console.error(
       "[webhook/whatsapp] ❌ unhandled error:",
@@ -1745,6 +1801,28 @@ const ok = await sendWhatsAppTemplate( phone, META_WORKSHOP_REMINDER_TEMPLATE, [
     });
   }
   return res.status(200).json({ ok: true });
+});
+
+// Called by course-web when a creator connects their own WhatsApp number (or taps "Set up my
+// messages"). Copies Kurso's approved templates into the creator's WhatsApp account.
+app.post("/internal/setup-own-number", async (req, res) => {
+  const auth = req.get("Authorization") || "";
+  if (!INTERNAL_BOT_SECRET || auth !== `Bearer ${INTERNAL_BOT_SECRET}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const { creatorId } = req.body || {};
+  if (!creatorId || typeof creatorId !== "string") {
+    return res.status(400).json({ error: "creatorId is required" });
+  }
+  res.status(202).json({ ok: true });
+  setupTemplates(creatorId, [
+    META_LIVE_REMINDER_TEMPLATE,
+    META_RECORDING_READY_TEMPLATE,
+    META_RECORDING_UNAVAILABLE_TEMPLATE,
+    META_WORKSHOP_CONFIRMATION_TEMPLATE,
+    META_WORKSHOP_REMINDER_TEMPLATE,
+    META_WORKSHOP_NUDGE_TEMPLATE,
+  ]).catch((e) => console.error("[setup-own-number] failed:", e.message));
 });
 
 app.get("/", (req, res) => {

@@ -92,7 +92,8 @@ function cacheSet(map, key, value, ttl) {
 
 // Only trust ids passed by our own web app (internal routes are secret-protected).
 function ctxFromBody(body) {
-  if (!body || typeof body.creatorId !== "string" || !body.creatorId) return null;
+  if (!body || typeof body.creatorId !== "string" || !body.creatorId)
+    return null;
   return {
     creatorId: body.creatorId,
     courseId: typeof body.courseId === "string" ? body.courseId : null,
@@ -111,9 +112,14 @@ async function ownerFromEnrollments(phone, courseName) {
     .limit(10);
   if (error || !data || data.length === 0) return null;
   const rows = data.filter((r) => r.courses && r.courses.creator_id);
-  const pick = (courseName && rows.find((r) => r.courses.name === courseName)) || rows[0];
+  const pick =
+    (courseName && rows.find((r) => r.courses.name === courseName)) || rows[0];
   if (!pick) return null;
-  return { creatorId: pick.courses.creator_id, courseId: pick.courses.id, workshopId: null };
+  return {
+    creatorId: pick.courses.creator_id,
+    courseId: pick.courses.id,
+    workshopId: null,
+  };
 }
 
 async function ownerFromWorkshops(phone, workshopTitle) {
@@ -134,8 +140,12 @@ async function ownerFromWorkshops(phone, workshopTitle) {
     .select("id, creator_id, title")
     .in("id", ids);
   if (!workshops || workshops.length === 0) return null;
-  const ordered = ids.map((id) => workshops.find((w) => w.id === id)).filter(Boolean);
-  const pick = (workshopTitle && ordered.find((w) => w.title === workshopTitle)) || ordered[0];
+  const ordered = ids
+    .map((id) => workshops.find((w) => w.id === id))
+    .filter(Boolean);
+  const pick =
+    (workshopTitle && ordered.find((w) => w.title === workshopTitle)) ||
+    ordered[0];
   if (!pick || !pick.creator_id) return null;
   return { creatorId: pick.creator_id, courseId: null, workshopId: pick.id };
 }
@@ -143,7 +153,11 @@ async function ownerFromWorkshops(phone, workshopTitle) {
 async function resolveOwner({ phone, kind, ctx, courseName, workshopTitle }) {
   try {
     if (ctx && ctx.creatorId) {
-      return { creatorId: ctx.creatorId, courseId: ctx.courseId || null, workshopId: ctx.workshopId || null };
+      return {
+        creatorId: ctx.creatorId,
+        courseId: ctx.courseId || null,
+        workshopId: ctx.workshopId || null,
+      };
     }
     if (!_supabase || !phone) return null;
     const workshopFirst = String(kind || "").startsWith("workshop");
@@ -152,8 +166,10 @@ async function resolveOwner({ phone, kind, ctx, courseName, workshopTitle }) {
     if (cached) return cached.value;
 
     const owner = workshopFirst
-      ? (await ownerFromWorkshops(phone, workshopTitle)) || (await ownerFromEnrollments(phone, courseName))
-      : (await ownerFromEnrollments(phone, courseName)) || (await ownerFromWorkshops(phone, workshopTitle));
+      ? (await ownerFromWorkshops(phone, workshopTitle)) ||
+        (await ownerFromEnrollments(phone, courseName))
+      : (await ownerFromEnrollments(phone, courseName)) ||
+        (await ownerFromWorkshops(phone, workshopTitle));
     cacheSet(ownerCache, key, owner, owner ? OWNER_TTL_MS : MISS_TTL_MS);
     return owner;
   } catch (err) {
@@ -163,7 +179,17 @@ async function resolveOwner({ phone, kind, ctx, courseName, workshopTitle }) {
 }
 
 // ── 1. a message was sent ───────────────────────────────────────────
-async function recordSend({ messageId, toPhone, kind, templateName, category, ctx, courseName, workshopTitle }) {
+async function recordSend({
+  messageId,
+  toPhone,
+  kind,
+  templateName,
+  category,
+  ctx,
+  courseName,
+  workshopTitle,
+  account,
+}) {
   try {
     if (!_supabase || !messageId) return;
     const base = {
@@ -175,17 +201,35 @@ async function recordSend({ messageId, toPhone, kind, templateName, category, ct
       billable: false,
       sent_at: new Date().toISOString(),
     };
-    const owner = await resolveOwner({ phone: toPhone, kind, ctx, courseName, workshopTitle });
+    let owner = await resolveOwner({
+      phone: toPhone,
+      kind,
+      ctx,
+      courseName,
+      workshopTitle,
+    });
+    if (account && account.creatorId) {
+      const same = owner && owner.creatorId === account.creatorId;
+      owner = {
+        creatorId: account.creatorId,
+        courseId: same ? owner.courseId : null,
+        workshopId: same ? owner.workshopId : null,
+      };
+    }
     if (!owner) {
-      const { error } = await _supabase.from("whatsapp_usage_unowned").insert({ ...base, note: "owner not found" });
-      if (error && error.code !== "23505") console.error("[usage] unowned insert failed:", error.message);
+      const { error } = await _supabase
+        .from("whatsapp_usage_unowned")
+        .insert({ ...base, note: "owner not found" });
+      if (error && error.code !== "23505")
+        console.error("[usage] unowned insert failed:", error.message);
       return;
     }
     const { error } = await _supabase.from("whatsapp_usage").insert({
       ...base,
       creator_id: owner.creatorId,
       course_id: owner.courseId,
-      workshop_id: owner.workshopId,
+            workshop_id: owner.workshopId,
+      ...(account ? { own_number: true } : {}),
     });
     if (error && error.code !== "23505") console.error("[usage] insert failed:", error.message);
   } catch (err) {
@@ -196,7 +240,11 @@ async function recordSend({ messageId, toPhone, kind, templateName, category, ct
 // ── 2. Meta's delivery report ───────────────────────────────────────
 async function patchRow(id, patch) {
   for (const table of ["whatsapp_usage", "whatsapp_usage_unowned"]) {
-    const { data, error } = await _supabase.from(table).update(patch).eq("wa_message_id", id).select("wa_message_id");
+    const { data, error } = await _supabase
+      .from(table)
+      .update(patch)
+      .eq("wa_message_id", id)
+      .select("wa_message_id");
     if (error) {
       console.error(`[usage] ${table} update failed:`, error.message);
       continue;
@@ -212,13 +260,16 @@ async function applyStatus(st, attempt = 0) {
     const patch = {};
     const pricing = st.pricing;
     if (pricing) {
-      if (typeof pricing.billable === "boolean") patch.billable = pricing.billable;
+      if (typeof pricing.billable === "boolean")
+        patch.billable = pricing.billable;
       const cat = mapMetaCategory(pricing.category);
       if (cat) patch.category = cat;
     }
     // A message that failed was not delivered and is not charged.
     if (st.status === "failed") patch.billable = false;
-    const tsIso = st.timestamp ? new Date(Number(st.timestamp) * 1000).toISOString() : new Date().toISOString();
+    const tsIso = st.timestamp
+      ? new Date(Number(st.timestamp) * 1000).toISOString()
+      : new Date().toISOString();
     if (st.status === "delivered") patch.delivered_at = tsIso;
 
     if (Object.keys(patch).length > 0) {
@@ -226,10 +277,18 @@ async function applyStatus(st, attempt = 0) {
       if (!matched) {
         // The send is saved a moment after Meta answers, so a very fast report can beat it. Try again shortly.
         if (attempt < STATUS_RETRY_DELAYS_MS.length) {
-          const t = setTimeout(() => applyStatus(st, attempt + 1), STATUS_RETRY_DELAYS_MS[attempt]);
+          const t = setTimeout(
+            () => applyStatus(st, attempt + 1),
+            STATUS_RETRY_DELAYS_MS[attempt],
+          );
           if (t.unref) t.unref();
         } else {
-          console.warn("[usage] no record found for message", st.id, "status", st.status);
+          console.warn(
+            "[usage] no record found for message",
+            st.id,
+            "status",
+            st.status,
+          );
         }
         return;
       }
@@ -238,13 +297,25 @@ async function applyStatus(st, attempt = 0) {
     // "read" proves it was delivered, even if we never saw "delivered". Keep the earliest time.
     if (st.status === "read") {
       for (const table of ["whatsapp_usage", "whatsapp_usage_unowned"]) {
-        await _supabase.from(table).update({ delivered_at: tsIso }).eq("wa_message_id", st.id).is("delivered_at", null);
+        await _supabase
+          .from(table)
+          .update({ delivered_at: tsIso })
+          .eq("wa_message_id", st.id)
+          .is("delivered_at", null);
       }
     }
 
-    if (FALLBACK_BILLABLE && !pricing && (st.status === "delivered" || st.status === "read")) {
+    if (
+      FALLBACK_BILLABLE &&
+      !pricing &&
+      (st.status === "delivered" || st.status === "read")
+    ) {
       for (const table of ["whatsapp_usage", "whatsapp_usage_unowned"]) {
-        await _supabase.from(table).update({ billable: true }).eq("wa_message_id", st.id).neq("category", "service");
+        await _supabase
+          .from(table)
+          .update({ billable: true })
+          .eq("wa_message_id", st.id)
+          .neq("category", "service");
       }
     }
   } catch (err) {
@@ -283,7 +354,10 @@ async function workshopWhatsappEnabled(workshopId) {
     cacheSet(whatsappFlagCache, workshopId, enabled, 60 * 1000);
     return enabled;
   } catch (err) {
-    console.error("[usage] workshopWhatsappEnabled failed (leaving WhatsApp on):", err.message);
+    console.error(
+      "[usage] workshopWhatsappEnabled failed (leaving WhatsApp on):",
+      err.message,
+    );
     return true;
   }
 }
@@ -301,14 +375,20 @@ async function isCreatorOverdue(creatorId) {
       .eq("status", "overdue")
       .limit(1);
     if (error) {
-      console.error("[usage] overdue check failed (not blocking):", error.message);
+      console.error(
+        "[usage] overdue check failed (not blocking):",
+        error.message,
+      );
       return false; // never block on an error
     }
     const overdue = Array.isArray(data) && data.length > 0;
     cacheSet(overdueCache, creatorId, overdue, OVERDUE_TTL_MS);
     return overdue;
   } catch (err) {
-    console.error("[usage] isCreatorOverdue failed (not blocking):", err.message);
+    console.error(
+      "[usage] isCreatorOverdue failed (not blocking):",
+      err.message,
+    );
     return false;
   }
 }
