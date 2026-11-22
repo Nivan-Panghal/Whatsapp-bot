@@ -1606,16 +1606,18 @@ app.post("/webhook/whatsapp", async (req, res) => {
         return res.status(403).send("Forbidden");
       }
     } else {
-      console.warn(
-        "[webhook/whatsapp] ⚠️ META_APP_SECRET not set — skipping signature check entirely",
+      console.error(
+        "[webhook/whatsapp] ❌ META_APP_SECRET not set — refusing the request (set it in the host's variables)",
       );
+      return res.status(403).send("Forbidden");
     }
 
     res.sendStatus(200); // ack immediately — Meta retries hard on non-200/timeout
 
+    // Log the shape only: the full body holds phone numbers and message text.
     console.log(
-      "[webhook/whatsapp] payload:",
-      JSON.stringify(req.body).slice(0, 2000),
+      "[webhook/whatsapp] payload received | entries:",
+      req.body?.entry?.length || 0,
     );
 
 // Delivery reports: Meta says here whether each message was delivered and what it charged.
@@ -1636,29 +1638,24 @@ if (!message) {
       message.id,
       "| type:",
       message.type,
-      "| from:",
-      message.from,
+      "| from: ***" + String(message.from || "").slice(-4),
     );
 
     // Idempotency check — WAMID plays the same role Twilio's MessageSid did
     const messageId = message.id;
     if (messageId) {
-      const { data: existing } = await supabase
+      // Claim first: the unique key makes a second near-simultaneous retry fail here.
+      const { error: claimErr } = await supabase
         .from("webhook_processed_messages")
-        .select("message_sid")
-        .eq("message_sid", messageId)
-        .maybeSingle();
-
-      if (existing) {
+        .insert({ message_sid: messageId });
+      if (claimErr?.code === "23505") {
         console.log(
           "[webhook/whatsapp] ℹ️ Already processed message ID:",
           messageId,
         );
         return;
       }
-      await supabase
-        .from("webhook_processed_messages")
-        .insert({ message_sid: messageId });
+      // Any other error (a brief database hiccup) must not drop a real message: carry on.
     }
 
     // Which of our numbers did the student write to? If it is a creator's own number, every reply
@@ -1684,6 +1681,18 @@ if (!message) {
 // secret instead of the Meta signature check. The 30-minute reminder does
 // NOT come through here — see pollLiveClassReminders below, which runs
 // entirely inside this process on its own timer.
+// Timing-safe check of the shared secret for every /internal route (the per-route checks below stay as a second lock).
+app.use("/internal", (req, res, next) => {
+  const given = Buffer.from(req.get("Authorization") || "");
+  const wanted = Buffer.from(`Bearer ${INTERNAL_BOT_SECRET}`);
+  const ok =
+    INTERNAL_BOT_SECRET &&
+    given.length === wanted.length &&
+    crypto.timingSafeEqual(given, wanted);
+  if (!ok) return res.status(401).json({ error: "Unauthorized" });
+  next();
+});
+
 app.post("/internal/send-reminder", async (req, res) => {
   const auth = req.get("Authorization") || "";
   if (!INTERNAL_BOT_SECRET || auth !== `Bearer ${INTERNAL_BOT_SECRET}`) {
@@ -1869,12 +1878,34 @@ async function pollLiveClassReminders() {
     if (!dueLessons || dueLessons.length === 0) return;
 
     for (const lesson of dueLessons) {
-      const { data: students, error: studentsError } = await supabase
-        .from("enrollments")
-        .select("phone, students(reminder_channel)")
-        .eq("course_uuid", lesson.course_id)
-        .eq("current_lesson", lesson.order_num)
-        .eq("payment_status", "paid");
+      // Claim this lesson first, so a slow run, the next tick or a second server can never send it twice.
+      const { data: claimed } = await supabase
+        .from("lessons")
+        .update({ reminder_30m_sent_at: new Date().toISOString() })
+        .eq("id", lesson.id)
+        .is("reminder_30m_sent_at", null)
+        .select("id");
+      if (!claimed || claimed.length === 0) continue;
+
+      // Page through the enrollments: the database returns at most 1000 rows per request.
+      const students = [];
+      let studentsError = null;
+      for (let from = 0; ; from += 1000) {
+        const { data: page, error: pageErr } = await supabase
+          .from("enrollments")
+          .select("phone, students(reminder_channel)")
+          .eq("course_uuid", lesson.course_id)
+          .eq("current_lesson", lesson.order_num)
+          .eq("payment_status", "paid")
+          .order("id", { ascending: true })
+          .range(from, from + 999);
+        if (pageErr) {
+          studentsError = pageErr;
+          break;
+        }
+        students.push(...(page || []));
+        if (!page || page.length < 1000) break;
+      }
 
       if (studentsError) {
         console.error(
@@ -1882,6 +1913,11 @@ async function pollLiveClassReminders() {
           lesson.id,
           studentsError.message,
         );
+        // Give the claim back so the next tick retries this lesson.
+        await supabase
+          .from("lessons")
+          .update({ reminder_30m_sent_at: null })
+          .eq("id", lesson.id);
         continue;
       }
 
@@ -1955,11 +1991,33 @@ for (const workshop of dueWorkshops) {
       .eq("id", workshop.id);
     continue;
   }
-  const { data: regs, error: regsError } = await supabase
-    .from("workshop_registrations")
-    .select("phone")
-        .eq("workshop_id", workshop.id)
-        .eq("payment_status", "confirmed");
+  // Claim this reminder first, so a slow run, the next tick or a second server can never send it twice.
+  const { data: claimed } = await supabase
+    .from("workshops")
+    .update({ reminder_1h_sent_at: new Date().toISOString() })
+    .eq("id", workshop.id)
+    .is("reminder_1h_sent_at", null)
+    .select("id");
+  if (!claimed || claimed.length === 0) continue;
+
+  // Page through the registrations: the database returns at most 1000 rows per request.
+  const regs = [];
+  let regsError = null;
+  for (let from = 0; ; from += 1000) {
+    const { data: page, error: pageErr } = await supabase
+      .from("workshop_registrations")
+      .select("phone")
+      .eq("workshop_id", workshop.id)
+      .eq("payment_status", "confirmed")
+      .order("id", { ascending: true })
+      .range(from, from + 999);
+    if (pageErr) {
+      regsError = pageErr;
+      break;
+    }
+    regs.push(...(page || []));
+    if (!page || page.length < 1000) break;
+  }
 
       if (regsError) {
         console.error(
@@ -1967,6 +2025,11 @@ for (const workshop of dueWorkshops) {
           workshop.id,
           regsError.message,
         );
+        // Give the claim back so the next tick retries this workshop.
+        await supabase
+          .from("workshops")
+          .update({ reminder_1h_sent_at: null })
+          .eq("id", workshop.id);
         continue;
       }
 
@@ -2015,6 +2078,22 @@ pollWorkshopReminders(); // also run once at startup
 // ever sends between 9:00 and 21:00 IST and only for creators who opted in.
 setInterval(pollWorkshopNudges, 5 * 60 * 1000);
 pollWorkshopNudges(); // also run once at startup
+
+// Housekeeping: forget processed-message ids after 14 days so the table does not grow forever.
+async function pruneProcessedMessages() {
+  try {
+    const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    const { error } = await supabase
+      .from("webhook_processed_messages")
+      .delete()
+      .lt("created_at", cutoff);
+    if (error) console.error("[prune] webhook_processed_messages:", error.message);
+  } catch (err) {
+    console.error("[prune] failed:", err.message);
+  }
+}
+setInterval(pruneProcessedMessages, 24 * 60 * 60 * 1000);
+setTimeout(pruneProcessedMessages, 60 * 1000);
 
 const PORT = process.env.PORT || 3003;
 
