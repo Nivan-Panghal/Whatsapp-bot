@@ -5,9 +5,9 @@
  *
  * Mirrors course-web/src/lib/phone.ts: `enrollments.phone`, `students.phone`
  * and `whatsapp_tokens.student_phone` are all stored as bare digits, no "+",
- * no spaces, NO COUNTRY CODE — because the web checkout form only ever
- * collects a 10-digit Indian number (see EnrollModal.tsx, which caps input
- * at 10 digits).
+ * no spaces. Indian numbers are stored as the bare 10 digits; numbers from
+ * other countries keep their country code (EnrollModal.tsx stores the
+ * selected country's code plus the number).
  *
  * Meta's WhatsApp Cloud API, however, always sends `metaMessage.from` WITH
  * the country code, e.g. "919306385029". Before this module existed, three
